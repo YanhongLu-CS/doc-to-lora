@@ -9,13 +9,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ctx_to_lora.data.processing import tokenize_ctx_text
+from ctx_to_lora.device import get_autocast_context, get_default_device
 from ctx_to_lora.model_loading import get_tokenizer
 from ctx_to_lora.modeling import hypernet
 
 sys.modules["ctx_to_lora.modeling_utils"] = hypernet
 
 # Global state
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = get_default_device()
 modulated_model = None
 chat_history = []
 ctx_tokenizer = None
@@ -89,7 +90,7 @@ def load_checkpoint(
         modulated_model = ModulatedPretrainedModel.from_state_dict(
             state_dict,
             train=False,
-            use_flash_attn=True,
+            use_flash_attn=device.type == "cuda",
             use_sequence_packing=False,
         )
         modulated_model = modulated_model.to(device).to(torch.bfloat16)
@@ -199,7 +200,7 @@ def generate_response(
         print(f"Processing single context with scaler: {context_scaler}")
         print(f"Bias scaler: {bias_scaler}")
 
-        with torch.inference_mode(), torch.amp.autocast(str(device)):
+        with torch.inference_mode(), get_autocast_context(device):
             ctx_inputs = process_context(context)
             ctx_ids = ctx_inputs["ctx_ids"].to(device)
             ctx_attn_mask = ctx_inputs["ctx_attn_mask"].to(device)

@@ -13,6 +13,12 @@ from transformers import (
     Gemma3ForConditionalGeneration,
 )
 
+from ctx_to_lora.device import (
+    get_default_dtype,
+    normalize_device,
+    should_use_flash_attn,
+)
+
 logger = logging.getLogger()
 
 GEMMA_VISION_MODELS = [
@@ -35,8 +41,8 @@ def get_model_and_tokenizer(
     model_kwargs=None,
     tokenizer_kwargs=None,
     use_q_lora=False,
-    device="cuda",
-    dtype=torch.bfloat16,
+    device=None,
+    dtype=None,
 ):
     model = get_model(
         model_name_or_path,
@@ -80,6 +86,14 @@ def get_tokenizer(
 
     template_path = f"chat_templates/{model_name_or_path}.jinja"
     if not os.path.exists(template_path):
+        model_name_lower = str(model_name_or_path).lower()
+        if "gemma-2-2b-it" in model_name_lower:
+            template_path = "chat_templates/google/gemma-2-2b-it.jinja"
+        elif "qwen3-4b-instruct-2507" in model_name_lower:
+            template_path = "chat_templates/Qwen/Qwen3-4B-Instruct-2507.jinja"
+        elif "mistral-7b-instruct-v0.2" in model_name_lower:
+            template_path = "chat_templates/mistralai/Mistral-7B-Instruct-v0.2.jinja"
+    if not os.path.exists(template_path):
         logger.warning(
             f"Chat template not found at {template_path}. Using default template."
         )
@@ -100,17 +114,20 @@ def get_model(
     peft_config=None,
     model_kwargs=None,
     use_q_lora=False,
-    device="cuda",
-    dtype=torch.bfloat16,
+    device=None,
+    dtype=None,
 ):
+    device = normalize_device(device)
+    dtype = dtype or get_default_dtype(device)
     model_init_kwargs = dict(
         pretrained_model_name_or_path=model_name_or_path,
-        device_map=device,
         torch_dtype=dtype,
         trust_remote_code=True,
         attn_implementation="eager",
         use_cache=None,
     )
+    if device.type != "npu":
+        model_init_kwargs["device_map"] = device.type
     is_vision_model = check_is_vision_model(model_name_or_path)
     if model_kwargs is not None:
         model_init_kwargs.update(model_kwargs)
@@ -119,7 +136,7 @@ def get_model(
         "bert" in model_name_or_path.lower() or "gte" in model_name_or_path.lower()
     )
 
-    if use_flash_attn:
+    if should_use_flash_attn(use_flash_attn, device):
         if "gte" not in model_name_or_path:
             model_init_kwargs["attn_implementation"] = "flash_attention_2"
         elif "gte" in model_name_or_path:
@@ -133,7 +150,7 @@ def get_model(
         model_init_kwargs["torch_dtype"] = torch.float32
         model_init_kwargs.pop("use_cache")
 
-    if use_q_lora:
+    if use_q_lora and device.type == "cuda":
         # https://huggingface.co/blog/4bit-transformers-bitsandbytes
         # https://colab.research.google.com/drive/1VoYNfYDKcKRQRor98Zbf2-9VQTtGJ24k?usp=sharing
         # see bitsandbytes for the quantization implementation https://github.com/bitsandbytes-foundation/bitsandbytes
@@ -156,6 +173,8 @@ def get_model(
     else:
         model = Gemma3ForConditionalGeneration.from_pretrained(**model_init_kwargs)
         model = model.language_model
+    if device.type == "npu":
+        model = model.to(device)
     if peft_config is not None:
         model = PeftModel(model, peft_config)
     model.train(train)

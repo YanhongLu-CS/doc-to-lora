@@ -22,6 +22,12 @@ if __name__ == "__main__":
         help="Path to the checkpoint to evaluate",
     )
     parser.add_argument(
+        "--base_model_path",
+        type=str,
+        default=None,
+        help="Optional local base model path to override checkpoint metadata",
+    )
+    parser.add_argument(
         "--split",
         type=str,
         choices=["validation", "test"],

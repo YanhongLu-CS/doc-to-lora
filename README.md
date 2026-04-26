@@ -82,6 +82,9 @@ uv run demo/app.py
 ### 🧪 Experimental Scripts
 To run any of the following scripts, use `uv run $PATH_TO_SCRIPT` from the root of this project.
 
+### Ascend 910B Inference
+For Huawei Ascend 910B inference-only setup, see [docs/ASCEND_910B_INFERENCE.md](docs/ASCEND_910B_INFERENCE.md).
+
 
 | Experiment                           | Data prep                             | Training                      | Evaluation                   | Notes                                                                                                                               |
 | ------------------------------------ | ------------------------------------- | ----------------------------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |

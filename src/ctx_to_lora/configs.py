@@ -575,18 +575,19 @@ class AggregatorArguments:
 
 # needed for loading model from checkpoint
 # see https://github.com/huggingface/transformers/pull/34632
-torch.serialization.add_safe_globals(
-    [
-        DataArguments,
-        CtxTrainingArguments,
-        ModelArguments,
-        LoRAArguments,
-        TrainingArguments,
-        HypernetArguments,
-        AggregatorArguments,
-        CtxEncoderArguments,
-    ]
-)
+if hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals(
+        [
+            DataArguments,
+            CtxTrainingArguments,
+            ModelArguments,
+            LoRAArguments,
+            TrainingArguments,
+            HypernetArguments,
+            AggregatorArguments,
+            CtxEncoderArguments,
+        ]
+    )
 
 
 if __name__ == "__main__":

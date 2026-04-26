@@ -31,6 +31,7 @@ from ctx_to_lora.configs import (
     CtxEncoderArguments,
     HypernetArguments,
 )
+from ctx_to_lora.device import get_autocast_context, should_use_flash_attn
 from ctx_to_lora.data.processing import tokenize_ctx_text
 from ctx_to_lora.model_loading import (
     get_model,
@@ -397,7 +398,7 @@ class HyperLoRA(nn.Module):
         n_ctx_chunks: Integer[Tensor, "n_ctx"] | None = None,
     ):
         # [bs, n_layers, n_total_modules, r, feature_dim]
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with get_autocast_context(features.device, dtype=torch.bfloat16):
             if self.aggregator.layer_to_layer and self.iterative_mode:
                 # iterative inference
                 # features: [bs num_layers seq_len feature_dim]
@@ -544,8 +545,11 @@ class ModulatedPretrainedModel(nn.Module):
             ctx_model_name,
             train=self.base_model.training,
             requires_grad=False,
-            use_flash_attn=base_model_attn_impl == "flash_attention_2",
+            use_flash_attn=should_use_flash_attn(
+                base_model_attn_impl == "flash_attention_2", self.device
+            ),
             use_q_lora=self.ctx_encoder_args.quantize_ctx_encoder,
+            device=self.device,
         )
         self.ctx_encoder = CTX_ENCODER_CLS[self.ctx_encoder_args.ctx_encoder_type](
             encoder_model, self.ctx_encoder_args
@@ -917,14 +921,15 @@ class ModulatedPretrainedModel(nn.Module):
 
 # needed for loading model from checkpoint
 # see https://github.com/huggingface/transformers/pull/34632
-torch.serialization.add_safe_globals(
-    [
-        AggregatorConfig,
-        LoraConfig,
-        HypernetConfig,
-        PeftType,
-        TaskType,
-        LoraRuntimeConfig,
-        set,  # for real?
-    ]
-)
+if hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals(
+        [
+            AggregatorConfig,
+            LoraConfig,
+            HypernetConfig,
+            PeftType,
+            TaskType,
+            LoraRuntimeConfig,
+            set,  # for real?
+        ]
+    )

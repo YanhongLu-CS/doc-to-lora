@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import os
@@ -10,7 +11,6 @@ from dataclasses import fields
 from functools import partial
 
 import numpy as np
-import pandas as pd
 import torch
 import yaml
 from datasets import disable_caching
@@ -51,6 +51,7 @@ from ctx_to_lora.model_loading import (
     get_model_and_tokenizer,
     get_tokenizer,
 )
+from ctx_to_lora.device import get_default_device, should_use_flash_attn
 from ctx_to_lora.modeling.context_distillation import CtxDistillModel
 from ctx_to_lora.modeling.generative_adapter import GenerativeAdapter
 from ctx_to_lora.modeling.hypernet import ModulatedPretrainedModel
@@ -66,6 +67,11 @@ from ctx_to_lora.tracker.tracker import (
 from ctx_to_lora.utils import clear_gpu, concat_list, get_run_name, setup_logging
 
 logger = logging.getLogger()
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
 
 # from https://gist.github.com/cloneofsimo/8abd0284d4738f28f04200628f9a83f5
@@ -329,6 +335,10 @@ def create_metrics_csv(
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    if pd is None:
+        logger.warning("pandas is unavailable; skipping evaluation CSV export")
+        return
+
     # Parse metrics to extract components
     all_metrics, all_length_groups, all_splits = _parse_metrics_for_csv(metrics_dict)
 
@@ -497,7 +507,17 @@ def decode_test_result(
 
         gen_toks = pred_toks[np.argmax(pred_toks != tokenizer.pad_token_id) :]
         # gen_toks = gen_toks[start_idx:]
-        suffix = np.array(CTX_AFFIXES[tokenizer.name_or_path]["suffix"])
+        tokenizer_name = tokenizer.name_or_path
+        if tokenizer_name not in CTX_AFFIXES:
+            tokenizer_name_lower = str(tokenizer_name).lower()
+            if "gemma-2-2b-it" in tokenizer_name_lower:
+                tokenizer_name = "google/gemma-2-2b-it"
+            elif "qwen3-4b-instruct-2507" in tokenizer_name_lower:
+                tokenizer_name = "Qwen/Qwen3-4B-Instruct-2507"
+            elif "mistral-7b-instruct-v0.2" in tokenizer_name_lower:
+                tokenizer_name = "mistralai/Mistral-7B-Instruct-v0.2"
+
+        suffix = np.array(CTX_AFFIXES[tokenizer_name]["suffix"])
         # iterate over gen_toks and take the answer after the suffix
         for i in range(len(gen_toks) - len(suffix), -1, -1):
             if all(gen_toks[i : i + len(suffix)] == suffix):
@@ -713,7 +733,14 @@ def evaluate(
     """Main evaluation function."""
     assert split in ["validation", "test"]
     ctx_name = None
-    model_kwargs = dict(attn_implementation="flash_attention_2")
+    device = get_default_device()
+    model_kwargs = dict(
+        attn_implementation=(
+            "flash_attention_2"
+            if should_use_flash_attn(True, device)
+            else "eager"
+        )
+    )
 
     tokenizer = get_tokenizer(args.model_name_or_path, train=False)
     if tokenizer.pad_token_id is None:
@@ -725,16 +752,20 @@ def evaluate(
 
     if model_name_or_path is None:
         try:
-            state_dict = torch.load(checkpoint_path, weights_only=False)
+            state_dict = torch.load(
+                checkpoint_path, map_location="cpu", weights_only=False
+            )
         except FileNotFoundError:
             raise FileNotFoundError(f"Checkpoint {checkpoint_path} not found. ")
+        if getattr(args, "base_model_path", None):
+            state_dict["base_model_name_or_path"] = args.base_model_path
         ctx_name = state_dict["ctx_encoder_args"].ctx_encoder_model_name_or_path
 
         model = ModulatedPretrainedModel.from_state_dict(
             state_dict,
             train=False,
             base_model_kwargs=model_kwargs,
-            use_flash_attn=True,
+            use_flash_attn=should_use_flash_attn(True, device),
             use_sequence_packing=False,  # for generation
             user_defined_scaling=args.gen_lora_scaling,
         )
@@ -756,7 +787,7 @@ def evaluate(
             train=False,
             requires_grad=False,
             model_kwargs=model_kwargs,
-            use_flash_attn=True,
+            use_flash_attn=should_use_flash_attn(True, device),
         )
         add_tracker(base_model.generate, "generate")
         if use_cd := getattr(args, "use_cd", False):
@@ -936,6 +967,7 @@ def evaluate(
     eval_trainer_args["use_liger_kernel"] = False
     eval_trainer_args["dataloader_num_workers"] = 0
     eval_trainer_args["dataloader_prefetch_factor"] = None
+    eval_trainer_args["report_to"] = []
 
     eval_trainer_args = Seq2SeqTrainingArguments(
         **eval_trainer_args,
@@ -1014,6 +1046,7 @@ def evaluate(
 def run_eval(
     checkpoint_path: str = None,
     model_name_or_path: str = None,
+    base_model_path: str = None,
     datasets: list[str] = None,
     split: str = "validation",
     eval_batch_size: int = 8,
@@ -1060,17 +1093,20 @@ def run_eval(
     disable_caching()
     set_seed(42)
 
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "true"
-    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
     os.environ["OMP_NUM_THREADS"] = "23"
+    device = get_default_device()
+    if should_use_flash_attn(True, device):
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
 
     # torch.use_deterministic_algorithms(True, warn_only=True)
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
     slurm_job_id = f"_{os.getenv('SLURM_JOB_ID')}" if os.getenv("SLURM_JOB_ID") else ""
     run_name = get_run_name(seed_str=time.strftime("%Y%m%d-%H%M%S") + slurm_job_id)
@@ -1082,13 +1118,25 @@ def run_eval(
         try:
             args = Namespace(**yaml.unsafe_load(open(f"{run_dir}/args.yaml")))
         except FileNotFoundError:
-            raise FileNotFoundError(f"Could not find args.yaml in {run_dir}. ")
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            args = Namespace(
+                model_name_or_path=base_model_path or state_dict["base_model_name_or_path"],
+                output_dir=f"{run_dir}/eval-results-{cur_it}/{run_name}",
+                logging_dir=f"{run_dir}/eval-results-{cur_it}/{run_name}",
+                run_name=run_dir.split("/")[-1],
+                val_ds_names=[],
+                test_ds_names=[],
+                remove_context=False,
+            )
         print(f"checkpoint_path: {checkpoint_path}")
         print(f"run_dir: {run_dir}")
 
         args.output_dir = f"{run_dir}/eval-results-{cur_it}/{run_name}"
         args.logging_dir = f"{run_dir}/eval-results-{cur_it}/{run_name}"
         args.run_name = run_dir.split("/")[-1]
+        args.base_model_path = base_model_path
+        if base_model_path:
+            args.model_name_or_path = base_model_path
         # modulated model doesn't see ctx by default
         # but remove_context has to be false for correct file naming
         args.remove_context = False
@@ -1106,6 +1154,7 @@ def run_eval(
             test_ds_names=[],
             remove_context=remove_context,
         )
+        args.base_model_path = base_model_path
         if use_cd:
             args.use_cd = use_cd
             args.cd_update_iterations = cd_update_iterations

@@ -9,6 +9,7 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
+from transformers.utils import is_flash_attn_2_available
 
 from ctx_to_lora.configs import (
     AggregatorArguments,
@@ -94,6 +95,9 @@ class Perceiver(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        attn_implementation = (
+            "flash_attention_2" if is_flash_attn_2_available() else "eager"
+        )
         assert num_extra_modules == 0
         self.num_layers = num_layers
         self.num_modules = num_modules
@@ -112,7 +116,7 @@ class Perceiver(nn.Module):
             n_latents=n_latent_queries,
             intermediate_size_factor=4,
             hidden_size=output_size,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
         )
         self.decoder_config = Idefics2PerceiverConfig(
             input_size=output_size,
@@ -122,7 +126,7 @@ class Perceiver(nn.Module):
             n_latents=n_output_queries,
             intermediate_size_factor=4,
             hidden_size=output_size,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
         )
         self.perceiver = Idefics2Perceiver(self.config, self.decoder_config)
         self.iterative_mode = False
