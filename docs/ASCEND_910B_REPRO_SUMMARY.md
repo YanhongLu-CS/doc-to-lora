@@ -1,41 +1,34 @@
-# Doc-to-LoRA on Ascend 910B: Gemma Reproduction Summary
+# Doc-to-LoRA on Ascend 910B: Reproduction Summary
 
-This document records the final local code changes and server-side setup used to run `doc-to-lora` inference and evaluation on Huawei Ascend 910B with a local Gemma base model.
+This document records what we changed from the upstream repository, what was configured on the server, what has already been reproduced successfully, and what remains out of scope.
 
 ## 1. Goal
 
-Run `doc-to-lora` on Ascend 910B for:
+Run `doc-to-lora` on a Huawei Ascend 910B-64G server for:
 
-- inference
-- evaluation
-- batched vs iterative comparison
-- base-model comparison
+- inference only
+- evaluation only
+- no training
 
-The final target line is Gemma-based:
+We support both Gemma and Qwen checkpoints:
+- Gemma: `trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin`
+- Qwen: `trained_d2l/qwen_4b_d2l/checkpoint-20000/pytorch_model.bin`
 
-- D2L checkpoint: `trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin`
-- local base model: `/home/apulis-dev/userdata/lyh/models/gemma-2-2b-it`
+We targeted a functionally equivalent inference and evaluation path on Ascend NPU.
 
-We did **not** target training support or a bit-for-bit recreation of the authors' CUDA environment. We targeted a functionally equivalent inference/evaluation path on Ascend NPU.
+## 2. Server-side Environment
 
-## 2. Final Server Environment
-
-We used the existing Conda environment:
-
-- env name: `lyh`
-
-Key runtime facts:
+We used the existing Python environment:
 
 - `torch==2.1.0`
 - `torch_npu` available
 - `torch.npu.is_available() == True`
-- execution happens on Ascend NPU, not CUDA
 
 Important operational choices:
 
 - we did **not** use the repo's original `install.sh`
-- we did **not** install CUDA-only packages such as `flash-attn`, `flashinfer`, `bitsandbytes`, `vllm`
-- Gemma is loaded from a local model directory, not from Hugging Face at runtime
+- we did **not** install CUDA packages such as `flash-attn`, `flashinfer`, `bitsandbytes`, `vllm`
+- Gemma is loaded from a local model directory when needed
 
 Packages explicitly installed during setup included:
 
@@ -50,13 +43,11 @@ Packages explicitly installed during setup included:
 - `rouge-score`
 - `llmlingua`
 
-One problematic package was removed:
+We also removed one problematic package:
 
 - `scikit-learn`
 
-Reason:
-
-- it caused `libgomp` / static TLS import failures when `transformers` imported sklearn transitively
+Reason: it caused `libgomp` / static TLS import failures when `transformers` imported sklearn transitively.
 
 ## 3. Why Gemma Needed Extra Adaptation
 
@@ -65,21 +56,16 @@ The original Gemma checkpoints store:
 - D2L hypernetwork weights
 - the upstream base model identifier `google/gemma-2-2b-it`
 
-In the actual server environment:
+In some server environments:
 
-- online loading through `hf-mirror.com` failed for gated Gemma access
-- even after account access was granted, runtime access through the mirror remained unreliable
-
-The practical solution was:
-
-1. download the entire Gemma base model offline or from a machine with working access
-2. place it locally at:
-   - `/home/apulis-dev/userdata/lyh/models/gemma-2-2b-it`
-3. add code support to override the checkpoint's remote base model name with that local path
+- online loading through HuggingFace may fail for gated Gemma access
+- the practical solution is to download the entire Gemma base model locally first
+- place it locally at: `/home/apulis-dev/userdata/lyh/models/gemma-2-2b-it`
+- add code support to override the checkpoint's remote base model name with that local path
 
 This is the key Gemma-specific difference from the earlier Qwen path.
 
-## 4. Final Code Changes
+## 4. Code Changes Made
 
 ### 4.1 New files
 
@@ -92,6 +78,7 @@ This is the key Gemma-specific difference from the earlier Qwen path.
 - `scripts/visualize_lora_queue_positions.py`
 - `docs/ASCEND_910B_INFERENCE.md`
 - `docs/ASCEND_910B_REPRO_SUMMARY.md`
+- `docs/INFERENCE.md`
 
 ### 4.2 Updated files
 
@@ -105,10 +92,9 @@ This is the key Gemma-specific difference from the earlier Qwen path.
 - `src/ctx_to_lora/modeling/hypernet.py`
 - `src/ctx_to_lora/modeling/idefics2.py`
 - `src/ctx_to_lora/utils.py`
+- `train.py`
 
-## 5. What Each Change Did
-
-### 5.1 Device selection and autocast
+### 4.3 Device selection
 
 Added `src/ctx_to_lora/device.py` to centralize:
 
@@ -120,34 +106,28 @@ Added `src/ctx_to_lora/device.py` to centralize:
 
 This removed hardcoded CUDA assumptions across inference and evaluation.
 
-### 5.2 Model loading compatibility
+### 4.4 Model loading compatibility
 
 In `src/ctx_to_lora/model_loading.py`:
 
-- changed default `device` / `dtype` handling to be device-aware
+- changed default `device`/`dtype` handling to be device-aware
 - stopped forcing `device_map="cuda"`
 - only enable `flash_attention_2` when truly on CUDA
 - only enable `bitsandbytes` quantization when on CUDA
 - move models onto NPU explicitly when `device.type == "npu"`
 
-Effect:
+Effect: NPU no longer falls into CUDA-only loading branches.
 
-- NPU no longer falls into CUDA-only loading branches
-
-### 5.3 Chat template fallback for local model paths
+### 4.5 Chat template fallback for local model paths
 
 Also in `src/ctx_to_lora/model_loading.py`:
 
 - local model paths now map back to known chat templates
-- for example:
-  - `/home/.../gemma-2-2b-it` -> `chat_templates/google/gemma-2-2b-it.jinja`
+- for example: `/home/.../gemma-2-2b-it` -> `chat_templates/google/gemma-2-2b-it.jinja`
 
-Effect:
+Effect: Gemma loaded from a local directory still uses the correct chat template.
 
-- Gemma loaded from a local directory still uses the correct chat template
-- avoids fallback to the default template and the `System role not supported` failure
-
-### 5.4 Hypernet compatibility
+### 4.6 Hypernet compatibility
 
 In `src/ctx_to_lora/modeling/hypernet.py`:
 
@@ -156,71 +136,46 @@ In `src/ctx_to_lora/modeling/hypernet.py`:
 - gated flash-attention use by device
 - guarded `torch.serialization.add_safe_globals` for older PyTorch
 
-Effect:
+Effect: `torch==2.1.0` can load checkpoints, NPU no longer tries to use CUDA-only hypernet code paths.
 
-- `torch==2.1.0` can load checkpoints
-- NPU no longer tries to use CUDA-only hypernet code paths
-
-### 5.5 Aggregator / Perceiver compatibility
+### 4.7 Aggregator / Perceiver compatibility
 
 In `src/ctx_to_lora/modeling/aggregator.py`:
 
-- attention implementation now becomes:
-  - `flash_attention_2` if flash-attn exists
-  - `eager` otherwise
+- attention implementation now becomes: `flash_attention_2` if flash-attn exists, `eager` otherwise
 
-Effect:
+Effect: the Perceiver path no longer assumes flash-attn is always present.
 
-- the Perceiver path no longer assumes flash-attn is always present
-
-### 5.6 Idefics2 Perceiver compatibility
+### 4.8 Idefics2 Perceiver compatibility
 
 In `src/ctx_to_lora/modeling/idefics2.py`:
 
 - enabled `"eager"` in `IDEFICS2_PERCEIVER_ATTENTION_CLASSES`
 - removed the hard assertion that flash-attention must be used
-- adapted `Idefics2PerceiverAttention` to support both:
-  - cross-attention
-  - self-attention
-- made `Idefics2PerceiverResampler` support:
-  - flash-attn path when available
-  - eager attention path otherwise
+- adapted `Idefics2PerceiverAttention` to support both cross-attention and self-attention
+- made `Idefics2PerceiverResampler` support flash-attn path when available and eager attention path otherwise
 
-Effect:
+Effect: the context compression path now runs on NPU without `flash-attn`.
 
-- the context compression path now runs on NPU without `flash-attn`
+### 4.9 Torch serialization compatibility
 
-### 5.7 Torch serialization compatibility
+In `src/ctx_to_lora/configs.py` and `src/ctx_to_lora/modeling/hypernet.py`:
 
-In:
+- wrapped `torch.serialization.add_safe_globals(...)` with `hasattr(torch.serialization, "add_safe_globals")`
 
-- `src/ctx_to_lora/configs.py`
-- `src/ctx_to_lora/modeling/hypernet.py`
+Effect: compatibility with `torch==2.1.0`.
 
-we wrapped `torch.serialization.add_safe_globals(...)` with:
-
-```python
-if hasattr(torch.serialization, "add_safe_globals"):
-```
-
-Effect:
-
-- compatibility with `torch==2.1.0`
-
-### 5.8 Inference script support for local Gemma
+### 4.10 Inference script support for local models
 
 Added and extended `examples/run_inference.py`:
 
 - minimal inference entrypoint
 - accepts checkpoint/document/question
-- now also accepts:
-  - `--base_model_path`
+- accepts `--base_model_path` for local model paths
 
-Effect:
+Effect: Gemma/Qwen checkpoints can be evaluated with a local base model directory.
 
-- Gemma checkpoints can be evaluated with a local base model directory instead of downloading `google/gemma-2-2b-it` online
-
-### 5.9 Evaluation support for local Gemma
+### 4.11 Evaluation support for local models
 
 In `run_eval.py`:
 
@@ -231,22 +186,13 @@ In `src/ctx_to_lora/eval_utils.py`:
 - checkpoint loads use `map_location="cpu"`
 - model loading is device-aware
 - CUDA backend flags are only set when CUDA is present
-- `wandb` reporting is disabled with:
-  - `report_to = []`
+- `wandb` reporting is disabled with `report_to = []`
 - CSV export tolerates broken or missing `pandas`
-- local base model override is propagated through:
-  - `run_eval(..., base_model_path=...)`
-  - `evaluate(...)`
-  - checkpoint state dict override
+- local base model override is propagated through the evaluation pipeline
 
-Effect:
+Effect: Gemma/Qwen evaluation can be run with a local base model path without online fetches.
 
-- Gemma evaluation can be run with:
-  - a D2L checkpoint
-  - a local Gemma base model path
-  - no online Gemma fetch
-
-### 5.10 Tokenizer-name normalization during evaluation decode
+### 4.12 Tokenizer-name normalization during evaluation decode
 
 Also in `src/ctx_to_lora/eval_utils.py`:
 
@@ -258,154 +204,85 @@ Examples:
 - local Qwen path -> `Qwen/Qwen3-4B-Instruct-2507`
 - local Mistral path -> `mistralai/Mistral-7B-Instruct-v0.2`
 
-Effect:
+Effect: evaluation no longer crashes when the tokenizer comes from a local path.
 
-- Gemma evaluation no longer crashes in `decode_test_result()` when the tokenizer comes from a local path
+### 4.13 Demo and simple inference
 
-### 5.11 Utility compatibility
+In `demo/app.py`:
+
+- device selection is now NPU-aware
+- flash-attn is only used on CUDA
+- autocast uses the runtime device
+
+Added `examples/run_inference.py`:
+
+- minimal CLI inference entrypoint
+- accepts checkpoint/document/question
+- loads on NPU successfully
+
+### 4.14 Evaluation compatibility
+
+In `src/ctx_to_lora/eval_utils.py`:
+
+- made model loading device-aware
+- avoided CUDA-specific backend configuration when CUDA is absent
+- added `map_location="cpu"` when loading checkpoints for evaluation
+- disabled `wandb` reporting via `eval_trainer_args["report_to"] = []`
+- made CSV export optional when `pandas` is unavailable or broken
 
 In `src/ctx_to_lora/utils.py`:
 
-- `clear_gpu()` now works safely for:
-  - CUDA
-  - NPU
-  - non-CUDA environments
+- made `clear_gpu()` safe for CUDA, NPU, and non-CUDA environments
 
-### 5.12 Visualization support
+Effect: `run_eval.py` now works on the Ascend inference environment.
 
-Added `scripts/visualize_eval_results.py`:
+## 5. Runtime / Data Issues We Worked Around
 
-- no `pandas` dependency
-- no `matplotlib` dependency
-- merges multiple eval result directories
-- generates:
-  - `merged_results.csv`
-  - `merged_results.json`
-  - `report.html`
+### 5.1 sklearn / libgomp TLS failure
 
-This is used to compare:
+Observed: `scikit-learn` import caused static TLS / `libgomp` failures
 
-- `base`
-- `batch`
-- `iterative`
+Resolution: removed `scikit-learn`
 
-for Gemma runs.
+### 5.2 pandas / GLIBCXX mismatch
 
-### 5.13 LoRA queue robustness experiment support
+Observed: `pandas` binary expected newer `libstdc++`
 
-Added `scripts/eval_lora_queue.py`:
+Resolution: made evaluation CSV export optional when `pandas` is unavailable
 
-- precomputes one raw adapter per sample
-- constructs a queue of current adapter plus previous `k-1` adapters
-- scales history adapters with `--history_scale`
-- evaluates robustness as queue length grows
-- writes:
-  - `queue_results.csv`
-  - `queue_results.json`
-  - `queue_samples.jsonl`
-  - `config.json`
-
-Added `scripts/visualize_lora_queue_results.py`:
-
-- merges one or more queue experiment runs
-- plots metrics against queue length
-- writes:
-  - `merged_queue_results.csv`
-  - `merged_queue_results.json`
-  - `report.html`
-
-Effect:
-
-- we can now test D2L robustness under accumulated adapter interference
-
-### 5.14 Queue-position experiment support
-
-Added `scripts/eval_lora_queue_positions.py`:
-
-- fixes queue length to a chosen value, typically `4`
-- varies the insertion position of the current adapter inside the queue
-- writes:
-  - `queue_position_results.csv`
-  - `queue_position_results.json`
-  - `queue_position_samples.jsonl`
-  - `config.json`
-
-Added `scripts/visualize_lora_queue_positions.py`:
-
-- visualizes metrics against `recent_position`
-- writes:
-  - `merged_queue_position_results.csv`
-  - `merged_queue_position_results.json`
-  - `report.html`
-
-Important interpretation:
-
-- in the current implementation, changing `recent_position` only reorders rank blocks before `combine_lora()`
-- because LoRA composition here is ultimately additive across the expanded rank dimension, simple rank-block reordering is mathematically order-invariant
-- therefore identical accuracy across positions is expected in this implementation and does **not** by itself indicate a bug
-
-Effect:
-
-- we can explicitly verify that rank-order permutation alone does not change the resulting adapter behavior
-
-## 6. Runtime Issues We Worked Around
-
-### 6.1 sklearn / libgomp TLS failure
-
-Observed:
-
-- `scikit-learn` import caused static TLS / `libgomp` failures
-
-Resolution:
-
-- removed `scikit-learn`
-
-### 6.2 pandas / GLIBCXX mismatch
-
-Observed:
-
-- `pandas` binary expected newer `libstdc++`
-
-Resolution:
-
-- made evaluation CSV export optional when `pandas` is unavailable
-
-### 6.3 Missing evaluation dependencies
+### 5.3 Missing evaluation dependencies
 
 Installed when needed:
 
 - `rouge-score`
 - `llmlingua`
 
-### 6.4 Dataset warnings
+### 5.4 Dataset warnings
 
-`datasets` emitted warnings around:
+`datasets` emitted warnings around `trust_remote_code`. In our current runs this behaved as a warning and did not block dataset loading after the raw data existed locally.
 
-- `trust_remote_code`
+## 6. Data and Models Prepared
 
-In our current runs this behaved as a warning/log message and did not block dataset loading after raw data existed locally.
+### 6.1 Base models
 
-## 7. Data and Models Prepared
+- local Gemma base model: `/home/apulis-dev/userdata/lyh/models/gemma-2-2b-it`
+- local Qwen base model: `/home/apulis-dev/userdata/lyh/models/Qwen3-4B`
 
-### 7.1 Base model
+### 6.2 D2L checkpoints
 
-- local Gemma base model:
-  - `/home/apulis-dev/userdata/lyh/models/gemma-2-2b-it`
+- Gemma: `trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin`
+- Qwen: `trained_d2l/qwen_4b_d2l/checkpoint-20000/pytorch_model.bin`
+- Mistral: `trained_d2l/mistral_7b_d2l/checkpoint-20000/pytorch_model.bin`
 
-### 7.2 D2L checkpoint
+### 6.3 Evaluation data
 
-- `trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin`
+- local SQuAD raw data: `data/raw_datasets/squad`
 
-### 7.3 Evaluation data
+Other datasets such as `drop` and `ropes` require network access to download.
 
-- local SQuAD raw data:
-  - `data/raw_datasets/squad`
+## 7. What Has Been Successfully Reproduced
 
-Other datasets such as `drop` and `ropes` were also prepared on the server for the main Gemma runs.
-
-## 8. What Has Been Successfully Reproduced
-
-### 8.1 Gemma inference
+### 7.1 Gemma inference
 
 Successful command pattern:
 
@@ -425,9 +302,25 @@ This successfully:
 - internalized the document
 - generated an answer on NPU
 
-### 8.2 Gemma evaluation
+### 7.2 Qwen inference
 
-Successful command pattern:
+```bash
+python examples/run_inference.py \
+  --checkpoint_path trained_d2l/qwen_4b_d2l/checkpoint-20000/pytorch_model.bin \
+  --base_model_path /home/apulis-dev/userdata/lyh/models/Qwen3-4B \
+  --document_path data/sakana_wiki.txt \
+  --question "Tell me about Sakana AI."
+```
+
+### 7.3 Evaluation
+
+Successful small-sample evaluation on:
+
+- `squad` (local)
+- `drop` (requires network)
+- `ropes` (requires network)
+
+Example command:
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0
@@ -437,85 +330,28 @@ python run_eval.py \
   --datasets squad \
   --split test \
   --eval_batch_size_gen 1 \
-  --max_test_samples_per_ds 10 \
+  --max_test_samples_per_ds 50 \
   --max_ctx_chunk_len 8192
 ```
 
-This successfully:
+## 8. What Is Reproduced vs. What Is Not
 
-- loaded the checkpoint
-- loaded the local Gemma base model
-- processed the dataset
-- generated evaluation outputs
-- decoded outputs
-- computed QA metrics
-
-### 8.3 Gemma comparison experiments
-
-The following three Gemma experiment modes have been run successfully:
-
-- `base`
-- `batch`
-- `iterative`
-
-These runs were then prepared for visualization with `scripts/visualize_eval_results.py`.
-
-### 8.4 Gemma LoRA queue robustness experiment
-
-The Gemma queue robustness experiment has also been run successfully:
-
-- dataset: `squad`
-- samples: `50`
-- mode: `batch`
-- queue lengths:
-  - `1`
-  - `2`
-  - `4`
-  - `8`
-
-This experiment evaluates whether the current adapter remains effective when older adapters are also attached.
-
-### 8.5 Gemma queue-position experiment
-
-The Gemma queue-position experiment has also been run:
-
-- dataset: `squad`
-- samples: `50`
-- mode: `batch`
-- queue length: `4`
-- recent positions:
-  - `0`
-  - `1`
-  - `2`
-  - `3`
-- history scale: `0.25`
-
-Observed result:
-
-- `qa_f1_score`, `qa_precision`, and `qa_recall` were effectively identical across all four `recent_position` settings
-
-Interpretation:
-
-- this is expected under the current implementation because the experiment only permutes the order of raw LoRA blocks before concatenation
-- after `combine_lora()` and LoRA application, this permutation does not change the final additive update
-- so this experiment verifies order-invariance of the current queue composition, rather than exposing a new robustness difference
-
-## 9. What Is Reproduced vs. What Is Not
-
-### 9.1 Reproduced now
+### 8.1 Reproduced now
 
 - Gemma-based D2L inference
 - Gemma-based D2L evaluation
+- Qwen-based D2L inference
+- Qwen-based D2L evaluation
 - Gemma `base` vs `batch` vs `iterative` comparison
 - HTML result visualization from saved eval runs
 
-### 9.2 Not in current scope
+### 8.2 Not in current scope
 
 - training
 - exact recreation of the authors' original CUDA performance characteristics
 - unsupported CUDA-only baselines that still assume the original stack end-to-end
 
-## 10. Is Functionality Reduced?
+## 9. Is Functionality Reduced?
 
 For the current NPU inference/evaluation target:
 
@@ -541,31 +377,18 @@ What is different from the original CUDA path:
 - memory behavior
 - some optional baseline/training workflows remain out of scope
 
-## 11. Recommended Reproducible Gemma Experiments
+## 10. Recommended Reproducible Experiments
 
 Best supported now:
 
-1. Single-document Gemma D2L inference
-2. Gemma D2L QA evaluation on:
-   - `squad`
-   - `drop`
-   - `ropes`
-3. Gemma `base` vs `batch` vs `iterative` comparison
-4. Gemma LoRA queue robustness evaluation
-5. Gemma queue-position order-invariance check
-6. HTML visualization of the comparison and queue results
+1. Single-document Gemma/Qwen D2L inference
+2. Gemma/Qwen D2L QA evaluation on `squad`
+3. Gemma/Qwen `base` vs `batch` vs `iterative` comparison
+4. HTML visualization of the comparison results
 
-## 12. Experiment Commands
+## 11. Experiment Commands
 
-This section lists the concrete script commands used for each experiment class.
-
-### 12.1 Gemma single-document inference
-
-Script:
-
-- `examples/run_inference.py`
-
-Command:
+### 11.1 Gemma single-document inference
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0
@@ -576,13 +399,18 @@ python examples/run_inference.py \
   --question "Tell me about Sakana AI."
 ```
 
-### 12.2 Gemma D2L small evaluation sanity check
+### 11.2 Qwen single-document inference
 
-Script:
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0
+python examples/run_inference.py \
+  --checkpoint_path trained_d2l/qwen_4b_d2l/checkpoint-20000/pytorch_model.bin \
+  --base_model_path /home/apulis-dev/userdata/lyh/models/Qwen3-4B \
+  --document_path data/sakana_wiki.txt \
+  --question "Tell me about Sakana AI."
+```
 
-- `run_eval.py`
-
-Command:
+### 11.3 Local evaluation (squad only)
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0
@@ -592,181 +420,23 @@ python run_eval.py \
   --datasets squad \
   --split test \
   --eval_batch_size_gen 1 \
-  --max_test_samples_per_ds 10 \
-  --max_ctx_chunk_len 8192
-```
-
-### 12.3 Gemma D2L batch evaluation
-
-Script:
-
-- `run_eval.py`
-
-Command:
-
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0
-python run_eval.py \
-  --checkpoint_path trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin \
-  --base_model_path /home/apulis-dev/userdata/lyh/models/gemma-2-2b-it \
-  --datasets squad drop ropes \
-  --split test \
-  --eval_batch_size_gen 1 \
   --max_test_samples_per_ds 50 \
   --max_ctx_chunk_len 8192
 ```
 
-### 12.4 Gemma D2L iterative evaluation
-
-Script:
-
-- `run_eval.py`
-
-Command:
-
-```bash
-export ASCEND_RT_VISIBLE_DEVICES=0
-python run_eval.py \
-  --checkpoint_path trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin \
-  --base_model_path /home/apulis-dev/userdata/lyh/models/gemma-2-2b-it \
-  --datasets squad drop ropes \
-  --split test \
-  --eval_batch_size_gen 1 \
-  --max_test_samples_per_ds 50 \
-  --max_ctx_chunk_len 8192 \
-  --use_iterative_mode
-```
-
-### 12.5 Gemma base-model evaluation
-
-Script:
-
-- `run_eval.py`
-
-Command:
+### 11.4 Base model evaluation (without D2L)
 
 ```bash
 export ASCEND_RT_VISIBLE_DEVICES=0
 python run_eval.py \
   --model_name_or_path /home/apulis-dev/userdata/lyh/models/gemma-2-2b-it \
-  --datasets squad drop ropes \
+  --datasets squad \
   --split test \
   --eval_batch_size_gen 1 \
-  --max_test_samples_per_ds 50 \
-  --max_ctx_chunk_len 8192
+  --max_test_samples_per_ds 50
 ```
 
-### 12.6 Gemma base vs batch vs iterative visualization
-
-Script:
-
-- `scripts/visualize_eval_results.py`
-
-Command template:
-
-```bash
-python scripts/visualize_eval_results.py \
-  --run batch=/path/to/batch_run_dir \
-  --run iterative=/path/to/iterative_run_dir \
-  --run base=/path/to/base_run_dir \
-  --output-dir /path/to/output_dir
-```
-
-### 12.7 Gemma LoRA queue robustness evaluation
-
-Script:
-
-- `scripts/eval_lora_queue.py`
-
-Command:
-
-```bash
-python scripts/eval_lora_queue.py \
-  --checkpoint_path trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin \
-  --base_model_path /home/apulis-dev/userdata/lyh/models/gemma-2-2b-it \
-  --datasets squad \
-  --split test \
-  --max_test_samples_per_ds 50 \
-  --max_ctx_chunk_len 8192 \
-  --queue_lengths 1 2 4 8 \
-  --history_scale 0.25
-```
-
-### 12.8 Gemma LoRA queue iterative robustness evaluation
-
-Script:
-
-- `scripts/eval_lora_queue.py`
-
-Command:
-
-```bash
-python scripts/eval_lora_queue.py \
-  --checkpoint_path trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin \
-  --base_model_path /home/apulis-dev/userdata/lyh/models/gemma-2-2b-it \
-  --datasets squad \
-  --split test \
-  --max_test_samples_per_ds 50 \
-  --max_ctx_chunk_len 8192 \
-  --queue_lengths 1 2 4 8 \
-  --history_scale 0.25 \
-  --use_iterative_mode
-```
-
-### 12.9 Gemma LoRA queue visualization
-
-Script:
-
-- `scripts/visualize_lora_queue_results.py`
-
-Command template:
-
-```bash
-python scripts/visualize_lora_queue_results.py \
-  --run batch=/path/to/batch_queue_run_dir \
-  --run iterative=/path/to/iterative_queue_run_dir \
-  --output-dir /path/to/output_dir
-```
-
-### 12.10 Gemma queue-position experiment
-
-Script:
-
-- `scripts/eval_lora_queue_positions.py`
-
-Command:
-
-```bash
-python scripts/eval_lora_queue_positions.py \
-  --checkpoint_path trained_d2l/gemma_demo/checkpoint-80000/pytorch_model.bin \
-  --base_model_path /home/apulis-dev/userdata/lyh/models/gemma-2-2b-it \
-  --datasets squad \
-  --split test \
-  --max_test_samples_per_ds 50 \
-  --max_ctx_chunk_len 8192 \
-  --queue_length 4 \
-  --recent_positions 0 1 2 3 \
-  --history_scale 0.25
-```
-
-### 12.11 Gemma queue-position visualization
-
-Script:
-
-- `scripts/visualize_lora_queue_positions.py`
-
-Command template:
-
-```bash
-python scripts/visualize_lora_queue_positions.py \
-  --run batch=/path/to/batch_queue_position_run_dir \
-  --run iterative=/path/to/iterative_queue_position_run_dir \
-  --output-dir /path/to/output_dir
-```
-
-## 13. Visualization Workflow
-
-The comparison script can be used like this:
+### 11.5 Visualization
 
 ```bash
 python scripts/visualize_eval_results.py \
@@ -782,34 +452,14 @@ Outputs:
 - `merged_results.json`
 - `report.html`
 
-The generated HTML report is intended as the main quick-look summary for experiment comparison.
-
-For queue experiments, the queue visualization script writes:
-
-- `merged_queue_results.csv`
-- `merged_queue_results.json`
-- `report.html`
-
-The queue report is intended to visualize how `qa_f1_score`, `qa_precision`, `qa_recall`, runtime, and throughput change as queue length increases.
-
-For queue-position experiments, the position visualization script writes:
-
-- `merged_queue_position_results.csv`
-- `merged_queue_position_results.json`
-- `report.html`
-
-The queue-position report is intended to visualize how metrics change with `recent_position`. In the current implementation, identical accuracy across positions should be interpreted as expected order-invariance, not necessarily as an implementation defect.
-
-## 14. Current Bottom Line
+## 12. Current Bottom Line
 
 At this point, the repository has been adapted so that:
 
-- Ascend 910B inference works
+- Ascend 910B inference works for Gemma and Qwen
 - Ascend 910B evaluation works
-- Gemma can be loaded from a local base model directory
-- Gemma `base`, `batch`, and `iterative` experiments are reproducible
-- Gemma LoRA queue robustness experiments are reproducible
-- Gemma queue-position experiments are reproducible
+- Gemma/Qwen can be loaded from a local base model directory
+- Gemma/Qwen `base`, `batch`, and `iterative` experiments are reproducible
 - result visualization is available without hardcoded paths
 
-The main remaining gap is not basic Gemma usability. The main remaining gap is only broader experiment coverage beyond the currently supported inference/evaluation workflow.
+The main remaining gap is broader experiment coverage beyond the currently supported inference/evaluation workflow.

@@ -176,7 +176,8 @@ def get_model(
     if device.type == "npu":
         model = model.to(device)
     if peft_config is not None:
-        model = PeftModel(model, peft_config)
+        model = PeftModel(model, peft_config, autocast_adapter_dtype=False)
+
     model.train(train)
     for name, param in model.named_parameters():
         param.requires_grad = requires_grad
@@ -198,5 +199,5 @@ def get_lora_config(model_dir, **kwargs):
     )
 
     peft_conf_kwargs.update(kwargs)
-    peft_config = _get_peft_config(peft_conf_kwargs)
+    peft_config = _get_peft_config(peft_conf_kwargs, autocast_adapter_dtype=False)
     return peft_config

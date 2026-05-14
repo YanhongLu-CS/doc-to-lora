@@ -33,3 +33,10 @@ eval_results/
 *.code-workspace
 .wandb/
 .ruff_cache/
+
+# New files
+kernel_meta/
+visualizations/
+*.json
+!pyproject.toml
+!uv.lock
